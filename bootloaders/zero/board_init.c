@@ -41,105 +41,65 @@ static void dfll_sync(void) {
 
 
 void board_init(void) {
-
   NVMCTRL->CTRLB.bit.RWS = 1;
-
-#if defined(CRYSTALLESS)
-  /* Configure OSC8M as source for GCLK_GEN 2 */
-  GCLK->GENDIV.reg = GCLK_GENDIV_ID(2);  // Read GENERATOR_ID - GCLK_GEN_2
-  gclk_sync();
-
-  GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(2) | GCLK_GENCTRL_SRC_OSC8M_Val | GCLK_GENCTRL_GENEN;
-  gclk_sync();
-
-  // Turn on DFLL with USB correction and sync to internal 8 mhz oscillator
+  
+  /* This works around a quirk in the hardware (errata 1.2.1) -
+    the DFLLCTRL register must be manually reset to this value before
+    configuration. */
+  while(!SYSCTRL->PCLKSR.bit.DFLLRDY);
   SYSCTRL->DFLLCTRL.reg = SYSCTRL_DFLLCTRL_ENABLE;
-  dfll_sync();
+  while(!SYSCTRL->PCLKSR.bit.DFLLRDY);
 
-  SYSCTRL_DFLLVAL_Type dfllval_conf = {0};
-  uint32_t coarse =( *((uint32_t *)(NVMCTRL_OTP4)
-           + (NVM_SW_CALIB_DFLL48M_COARSE_VAL / 32))
-         >> (NVM_SW_CALIB_DFLL48M_COARSE_VAL % 32))
-    & ((1 << 6) - 1);
-  if (coarse == 0x3f) {
-    coarse = 0x1f;
-  }
-  dfllval_conf.bit.COARSE  = coarse;
-  // TODO(tannewt): Load this from a well known flash location so that it can be
-  // calibrated during testing.
-  dfllval_conf.bit.FINE    = 0x1ff;
+    /* Write the coarse and fine calibration from NVM. */
+  uint32_t coarse =
+      ((*(uint32_t*)FUSES_DFLL48M_COARSE_CAL_ADDR) & FUSES_DFLL48M_COARSE_CAL_Msk) >> FUSES_DFLL48M_COARSE_CAL_Pos;
+  uint32_t fine =
+      ((*(uint32_t*)FUSES_DFLL48M_FINE_CAL_ADDR) & FUSES_DFLL48M_FINE_CAL_Msk) >> FUSES_DFLL48M_FINE_CAL_Pos;
 
-  SYSCTRL->DFLLMUL.reg = SYSCTRL_DFLLMUL_CSTEP( 0x1f / 4 ) | // Coarse step is 31, half of the max value
-                         SYSCTRL_DFLLMUL_FSTEP( 10 ) |
-                         48000;
-  SYSCTRL->DFLLVAL.reg = dfllval_conf.reg;
-  SYSCTRL->DFLLCTRL.reg = 0;
-  dfll_sync();
-  SYSCTRL->DFLLCTRL.reg = SYSCTRL_DFLLCTRL_MODE |
-                          SYSCTRL_DFLLCTRL_CCDIS |
-                          SYSCTRL_DFLLCTRL_USBCRM | /* USB correction */
-                          SYSCTRL_DFLLCTRL_BPLCKC;
-  dfll_sync();
-  SYSCTRL->DFLLCTRL.reg |= SYSCTRL_DFLLCTRL_ENABLE ;
-  dfll_sync();
+  SYSCTRL->DFLLVAL.reg = SYSCTRL_DFLLVAL_COARSE(coarse) | SYSCTRL_DFLLVAL_FINE(fine);
 
-  GCLK_CLKCTRL_Type clkctrl={0};
-  uint16_t temp;
-  GCLK->CLKCTRL.bit.ID = 2; // GCLK_ID - DFLL48M Reference
-  temp = GCLK->CLKCTRL.reg;
-  clkctrl.bit.CLKEN = 1;
-  clkctrl.bit.WRTLOCK = 0;
-  clkctrl.bit.GEN = GCLK_CLKCTRL_GEN_GCLK0_Val;
-  GCLK->CLKCTRL.reg = (clkctrl.reg | temp);
+  /* Wait for the write to finish. */
+  while (!SYSCTRL->PCLKSR.bit.DFLLRDY) {};
 
-#else
+  SYSCTRL->DFLLCTRL.reg |=
+    /* Enable USB clock recovery mode */
+    SYSCTRL_DFLLCTRL_USBCRM |
+    /* Disable chill cycle as per datasheet to speed up locking.
+       This is specified in section 17.6.7.2.2, and chill cycles
+       are described in section 17.6.7.2.1. */
+    SYSCTRL_DFLLCTRL_CCDIS;
 
-    SYSCTRL->XOSC32K.reg =
-        SYSCTRL_XOSC32K_STARTUP(6) | SYSCTRL_XOSC32K_XTALEN | SYSCTRL_XOSC32K_EN32K;
-    SYSCTRL->XOSC32K.bit.ENABLE = 1;
-    while ((SYSCTRL->PCLKSR.reg & SYSCTRL_PCLKSR_XOSC32KRDY) == 0)
-        ;
+  /* Configure the DFLL to multiply the 1 kHz clock to 48 MHz */
+  SYSCTRL->DFLLMUL.reg =
+      /* This value is output frequency / reference clock frequency,
+        so 48 MHz / 1 kHz */
+      SYSCTRL_DFLLMUL_MUL(48000) |
+      /* The coarse and fine values can be set to their minimum
+        since coarse is fixed in USB clock recovery mode and
+        fine should lock on quickly. */
+      SYSCTRL_DFLLMUL_FSTEP(1) |
+      SYSCTRL_DFLLMUL_CSTEP(1);
 
-    GCLK->GENDIV.reg = GCLK_GENDIV_ID(1);
-    gclk_sync();
+  SYSCTRL->DFLLCTRL.bit.MODE = 1;
 
-    GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(1) | GCLK_GENCTRL_SRC_XOSC32K | GCLK_GENCTRL_GENEN;
-    gclk_sync();
+  /* Enable the DFLL */
+  SYSCTRL->DFLLCTRL.bit.ENABLE = 1;
 
-    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(0) | GCLK_CLKCTRL_GEN_GCLK1 | GCLK_CLKCTRL_CLKEN;
-    gclk_sync();
+  /* Wait for the write to complete */
+  while (!SYSCTRL->PCLKSR.bit.DFLLRDY) {};
 
-    SYSCTRL->DFLLCTRL.bit.ONDEMAND = 0;
-    dfll_sync();
+    /* Setup GCLK0 using the DFLL @ 48 MHz */
+  GCLK->GENCTRL.reg =
+      GCLK_GENCTRL_ID(0) |
+      GCLK_GENCTRL_SRC_DFLL48M |
+      /* Improve the duty cycle. */
+      GCLK_GENCTRL_IDC |
+      GCLK_GENCTRL_GENEN;
 
-    SYSCTRL->DFLLMUL.reg = SYSCTRL_DFLLMUL_CSTEP(31) | SYSCTRL_DFLLMUL_FSTEP(511) |
-                           SYSCTRL_DFLLMUL_MUL((CPU_FREQUENCY / (32 * 1024)));
-    dfll_sync();
+  /* Wait for the write to complete */
+  while(GCLK->STATUS.bit.SYNCBUSY) {};
 
-    SYSCTRL->DFLLCTRL.reg |=
-        SYSCTRL_DFLLCTRL_MODE | SYSCTRL_DFLLCTRL_WAITLOCK | SYSCTRL_DFLLCTRL_QLDIS;
-    dfll_sync();
-
-    SYSCTRL->DFLLCTRL.reg |= SYSCTRL_DFLLCTRL_ENABLE;
-
-    while ((SYSCTRL->PCLKSR.reg & SYSCTRL_PCLKSR_DFLLLCKC) == 0 ||
-           (SYSCTRL->PCLKSR.reg & SYSCTRL_PCLKSR_DFLLLCKF) == 0)
-        ;
-    dfll_sync();
-
-#endif
-
-    // Configure DFLL48M as source for GCLK_GEN 0
-    GCLK->GENDIV.reg = GCLK_GENDIV_ID(0);
-    gclk_sync();
-
-    // Add GCLK_GENCTRL_OE below to output GCLK0 on the SWCLK pin.
-    GCLK->GENCTRL.reg =
-        GCLK_GENCTRL_ID(0) | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_IDC | GCLK_GENCTRL_GENEN;
-    gclk_sync();
-
-    SysTick_Config(1000);
-
+  SysTick_Config(1000);
     // Uncomment these two lines to output GCLK0 on the SWCLK pin.
     // PORT->Group[0].PINCFG[30].bit.PMUXEN = 1;
     // Set the port mux mask for odd processor pin numbers, PA30 = 30 is even number, PMUXE = PMUX Even
